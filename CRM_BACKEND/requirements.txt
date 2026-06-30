@@ -1,8 +1,0 @@
-fastapi
-uvicorn
-psycopg[binary]
-psycopg-pool
-bcrypt
-PyJWT
-python-dotenv
-pydantic
