@@ -134,7 +134,7 @@ def send_push_notification(user_id: int, title: str, message: str, type_str: str
             data={"type": type_str},
             tokens=tokens,
         )
-        messaging.send_multicast(msg)
+        messaging.send_each_for_multicast(msg)
         print(f"Successfully sent push notification to user_id: {user_id}")
     except Exception as e:
         print(f"Failed to send push notification to user {user_id}: {e}")
