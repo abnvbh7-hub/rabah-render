@@ -10,4 +10,5 @@ firebase-admin
 langchain
 langchain-core
 langchain-groq
+python-multipart
 
