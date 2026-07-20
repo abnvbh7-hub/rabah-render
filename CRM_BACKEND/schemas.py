@@ -207,3 +207,23 @@ class UserUpdate(BaseModel):
     joining_date: Optional[str] = None
     is_active: Optional[bool] = None
     biometric_id: Optional[str] = None
+
+class EmployeeConvertRequest(BaseModel):
+    password: str
+    salary: Optional[float] = 0.0
+    department: Optional[str] = ""
+    designation: Optional[str] = ""
+    biometric_id: Optional[str] = ""
+    name: Optional[str] = None
+    email: Optional[str] = None
+    phone: Optional[str] = None
+    role: Optional[str] = None
+
+class ForgotPasswordRequest(BaseModel):
+    employee_id: str
+
+class ResetPasswordRequest(BaseModel):
+    employee_id: str
+    otp: str
+    new_password: str
+

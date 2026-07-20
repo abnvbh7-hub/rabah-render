@@ -1,9 +1,12 @@
 import os
 import uvicorn
 import dotenv
-from fastapi import FastAPI, Depends, HTTPException, status, Query, Request
-from fastapi.responses import PlainTextResponse
+from fastapi import FastAPI, Depends, HTTPException, status, Query, Request, File, UploadFile, Form
+from fastapi.staticfiles import StaticFiles
+from fastapi.responses import PlainTextResponse, Response
 from fastapi.middleware.cors import CORSMiddleware
+import shutil
+import uuid
 from typing import Optional, List
 from datetime import datetime, date, timedelta, timezone
 from decimal import Decimal
@@ -59,6 +62,9 @@ from schemas import (
     ReminderCreate,
     UserUpdate,
     PinLocationRequest,
+    EmployeeConvertRequest,
+    ForgotPasswordRequest,
+    ResetPasswordRequest,
 )
 
 dotenv.load_dotenv()
@@ -90,7 +96,30 @@ try:
     """)
     db_execute("ALTER TABLE orders ADD COLUMN IF NOT EXISTS in_stock BOOLEAN DEFAULT FALSE;")
     db_execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS biometric_id VARCHAR(50);")
-    print("Notifications, user_devices tables, in_stock and biometric_id columns verified/created.")
+    db_execute("""
+    CREATE TABLE IF NOT EXISTS employee_leads (
+        id SERIAL PRIMARY KEY,
+        name VARCHAR(255) NOT NULL,
+        email VARCHAR(255) NOT NULL,
+        phone VARCHAR(50) NOT NULL,
+        role VARCHAR(50) NOT NULL,
+        resume_path VARCHAR(500),
+        status VARCHAR(50) DEFAULT 'pending',
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
+    """)
+    db_execute("ALTER TABLE employee_leads ADD COLUMN IF NOT EXISTS resume_data BYTEA;")
+    db_execute("ALTER TABLE employee_leads ADD COLUMN IF NOT EXISTS resume_filename VARCHAR(255);")
+    db_execute("""
+    CREATE TABLE IF NOT EXISTS password_otps (
+        id SERIAL PRIMARY KEY,
+        email VARCHAR(255) NOT NULL,
+        otp VARCHAR(6) NOT NULL,
+        expires_at TIMESTAMP NOT NULL,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
+    """)
+    print("Notifications, user_devices, employee_leads, password_otps tables, in_stock and biometric_id columns verified/created.")
 except Exception as e:
     print(f"Error creating database tables or altering: {e}")
 
@@ -275,6 +304,9 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+os.makedirs("uploads/resumes", exist_ok=True)
+app.mount("/uploads", StaticFiles(directory="uploads"), name="uploads")
+
 def parse_order_status(db_status: str):
     """Split orders.status (e.g. 'New|Pending Approval') into (stage, status)."""
     if not db_status:
@@ -331,7 +363,7 @@ def find_user_by_eid(eid: str):
     return None
 
 @app.post("/signup")
-def signup(req: SignupRequest):
+def signup(req: SignupRequest, current_user: dict = Depends(RoleChecker(["admin", "hr"]))):
 
     existing = db_query("SELECT id FROM users WHERE email = %s", (req.email,), fetch_one=True)
     if existing:
@@ -392,6 +424,168 @@ def signup(req: SignupRequest):
         "employee_id": generated_eid
     }
 
+@app.post("/employee-leads")
+def create_employee_lead(
+    name: str = Form(...),
+    email: str = Form(...),
+    phone: str = Form(...),
+    role: str = Form(...),
+    resume: Optional[UploadFile] = File(None),
+    current_user: dict = Depends(RoleChecker(["admin", "hr"]))
+):
+    existing_user = db_query("SELECT id FROM users WHERE email = %s", (email,), fetch_one=True)
+    if existing_user:
+        raise HTTPException(status_code=400, detail="An active employee with this email is already registered")
+
+    resume_data = None
+    resume_filename = None
+    if resume:
+        if not resume.filename.lower().endswith('.pdf'):
+            raise HTTPException(status_code=400, detail="Only PDF resumes are allowed")
+        resume_data = resume.file.read()
+        resume_filename = resume.filename
+
+    lead_id = db_execute(
+        """
+        INSERT INTO employee_leads (name, email, phone, role, resume_data, resume_filename, status)
+        VALUES (%s, %s, %s, %s, %s, %s, 'pending')
+        RETURNING id
+        """,
+        (name, email, phone, role, resume_data, resume_filename),
+        return_id=True
+    )
+
+    if resume and lead_id:
+        resume_path = f"/employee-leads/{lead_id}/resume"
+        db_execute(
+            "UPDATE employee_leads SET resume_path = %s WHERE id = %s",
+            (resume_path, lead_id)
+        )
+    
+    return {"status": "success", "message": "Employee lead created successfully"}
+
+@app.get("/employee-leads")
+def list_employee_leads(current_user: dict = Depends(RoleChecker(["admin", "hr"]))):
+    leads = db_query("""
+        SELECT id, name, email, phone, role, resume_path, status, created_at, resume_filename 
+        FROM employee_leads 
+        ORDER BY id DESC
+    """)
+    return {"status": "success", "leads": leads}
+
+@app.get("/employee-leads/{id}/resume")
+def get_employee_lead_resume(id: int):
+    lead = db_query("SELECT resume_data, resume_filename FROM employee_leads WHERE id = %s", (id,), fetch_one=True)
+    if not lead or not lead["resume_data"]:
+        raise HTTPException(status_code=404, detail="Resume not found")
+    
+    data = lead["resume_data"]
+    if isinstance(data, memoryview):
+        data = data.tobytes()
+        
+    filename = lead["resume_filename"] or "resume.pdf"
+    
+    return Response(
+        content=data,
+        media_type="application/pdf",
+        headers={
+            "Content-Disposition": f'inline; filename="{filename}"'
+        }
+    )
+
+@app.delete("/employee-leads/{id}")
+def delete_employee_lead(id: int, current_user: dict = Depends(RoleChecker(["admin", "hr"]))):
+    lead = db_query("SELECT resume_path FROM employee_leads WHERE id = %s", (id,), fetch_one=True)
+    if lead and lead["resume_path"] and lead["resume_path"].startswith("/uploads"):
+        try:
+            path = lead["resume_path"].lstrip('/')
+            if os.path.exists(path):
+                os.remove(path)
+        except Exception as e:
+            print(f"Error removing resume file: {e}")
+    db_execute("DELETE FROM employee_leads WHERE id = %s", (id,))
+    return {"status": "success", "message": "Employee lead deleted successfully"}
+
+@app.post("/employee-leads/{id}/convert")
+def convert_employee_lead(id: int, req: EmployeeConvertRequest, current_user: dict = Depends(RoleChecker(["admin", "hr"]))):
+    lead = db_query("SELECT * FROM employee_leads WHERE id = %s", (id,), fetch_one=True)
+    if not lead:
+        raise HTTPException(status_code=404, detail="Employee lead not found")
+    
+    if lead["status"] == "converted":
+        raise HTTPException(status_code=400, detail="Lead already converted to employee")
+    
+    lead_name = req.name if req.name is not None else lead["name"]
+    lead_email = req.email if req.email is not None else lead["email"]
+    lead_phone = req.phone if req.phone is not None else lead["phone"]
+    lead_role = req.role if req.role is not None else lead["role"]
+
+    # Update lead record with any changes
+    db_execute(
+        "UPDATE employee_leads SET name = %s, email = %s, phone = %s, role = %s WHERE id = %s",
+        (lead_name, lead_email, lead_phone, lead_role, id)
+    )
+
+    existing = db_query("SELECT id FROM users WHERE email = %s", (lead_email,), fetch_one=True)
+    if existing:
+        raise HTTPException(status_code=400, detail="An employee with this email is already registered")
+    
+    role_upper = lead_role.upper()
+    prefix = "EMP"
+    if role_upper == "ADMIN":
+        prefix = "ADM"
+    elif role_upper == "SALES":
+        prefix = "SAL"
+    elif role_upper == "INVENTORY":
+        prefix = "INV"
+    elif role_upper == "PRODUCTION":
+        prefix = "PRD"
+    elif role_upper == "HR":
+        prefix = "HR"
+    elif role_upper == "ACCOUNTANT":
+        prefix = "ACC"
+
+    existing_ids = db_query("SELECT employee_id FROM users WHERE employee_id LIKE %s", (f"{prefix}%",))
+    numbers = []
+    for item in existing_ids:
+        eid = item["employee_id"]
+        if eid:
+            digit_part = "".join([char for char in eid if char.isdigit()])
+            if digit_part:
+                try:
+                    numbers.append(int(digit_part))
+                except ValueError:
+                    pass
+    next_num = max(numbers) + 1 if numbers else 1
+    generated_eid = f"{prefix}{next_num:03d}"
+
+    pw_hash = hash_password(req.password)
+
+    role_row = db_query("SELECT id FROM roles WHERE role_name = %s", (role_upper,), fetch_one=True)
+    if not role_row:
+        role_id = db_execute("INSERT INTO roles (role_name) VALUES (%s) RETURNING id", (role_upper,), return_id=True)
+    else:
+        role_id = role_row["id"]
+
+    user_id = db_execute(
+        """
+        INSERT INTO users (name, email, phone, password_hash, role_id, employee_id, salary, department, designation, biometric_id, is_active)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, true)
+        RETURNING id
+        """,
+        (lead_name, lead_email, lead_phone, pw_hash, role_id, generated_eid, req.salary, req.department, req.designation, req.biometric_id),
+        return_id=True
+    )
+
+    db_execute("UPDATE employee_leads SET status = 'converted' WHERE id = %s", (id,))
+
+    return {
+        "status": "success",
+        "message": "Employee lead converted successfully",
+        "employee_id": generated_eid,
+        "user_id": user_id
+    }
+
 def auto_cleanup_forgotten_checkouts(user_id: int):
     """If a user has check-in but no check-out for any day before today, mark it as ABSENT."""
     try:
@@ -407,6 +601,96 @@ def auto_cleanup_forgotten_checkouts(user_id: int):
         )
     except Exception as e:
         print(f"Error in auto_cleanup_forgotten_checkouts: {e}")
+
+import random
+
+@app.post("/forgot-password")
+def forgot_password(req: ForgotPasswordRequest):
+    user = find_user_by_eid(req.employee_id)
+    if not user:
+        raise HTTPException(status_code=404, detail="Employee not found with provided ID or Email")
+    
+    if not user.get("email"):
+        raise HTTPException(status_code=400, detail="This user does not have a registered email address")
+    
+    # Generate 6-digit OTP
+    otp = f"{random.randint(100000, 999999)}"
+    expires_at = get_now_ist() + timedelta(minutes=10)
+    
+    # Insert OTP
+    db_execute(
+        "INSERT INTO password_otps (email, otp, expires_at) VALUES (%s, %s, %s)",
+        (user["email"], otp, expires_at)
+    )
+    
+    # Send email
+    try:
+        from mail import send_email
+        email_body = f"""
+        <html>
+            <body style="font-family: Arial, sans-serif; color: #333; line-height: 1.6; padding: 20px;">
+                <div style="max-width: 500px; margin: 0 auto; border: 1px solid #e2e8f0; border-radius: 12px; padding: 24px; box-shadow: 0 4px 6px -1px rgba(0,0,0,0.1);">
+                    <h2 style="color: #4f46e5; margin-top: 0;">Password Reset OTP</h2>
+                    <p>You requested a password reset for your Papyrus CRM account.</p>
+                    <div style="background: #f1f5f9; padding: 16px; border-radius: 8px; text-align: center; font-size: 24px; font-weight: bold; letter-spacing: 4px; color: #1e293b; margin: 20px 0;">
+                        {otp}
+                    </div>
+                    <p style="font-size: 13px; color: #64748b;">This OTP is valid for 10 minutes. If you did not make this request, please ignore this email.</p>
+                </div>
+            </body>
+        </html>
+        """
+        send_email(user["email"], "Papyrus CRM Password Reset OTP", email_body)
+    except Exception as e:
+        print(f"Error sending password reset email: {e}")
+        raise HTTPException(status_code=500, detail="Failed to send OTP email")
+    
+    # Obfuscate email for security response (e.g. a***b@domain.com)
+    email_parts = user["email"].split("@")
+    if len(email_parts) == 2:
+        name_part, domain_part = email_parts[0], email_parts[1]
+        obfuscated_name = name_part[0] + "*" * (len(name_part) - 2) + name_part[-1] if len(name_part) > 2 else name_part[0] + "*"
+        obfuscated_email = f"{obfuscated_name}@{domain_part}"
+    else:
+        obfuscated_email = user["email"]
+        
+    return {
+        "status": "success",
+        "message": "OTP has been sent to your registered email",
+        "email": obfuscated_email
+    }
+
+@app.post("/reset-password")
+def reset_password(req: ResetPasswordRequest):
+    user = find_user_by_eid(req.employee_id)
+    if not user:
+        raise HTTPException(status_code=404, detail="Employee not found")
+        
+    if not user.get("email"):
+        raise HTTPException(status_code=400, detail="Employee has no email registered")
+        
+    # Verify latest OTP
+    now = get_now_ist()
+    otp_row = db_query(
+        "SELECT * FROM password_otps WHERE email = %s AND expires_at > %s ORDER BY id DESC LIMIT 1",
+        (user["email"], now),
+        fetch_one=True
+    )
+    
+    if not otp_row or otp_row["otp"] != req.otp:
+        raise HTTPException(status_code=400, detail="Invalid or expired OTP")
+        
+    # Update password
+    pw_hash = hash_password(req.new_password)
+    db_execute("UPDATE users SET password_hash = %s WHERE id = %s", (pw_hash, user["id"]))
+    
+    # Clean up OTPs for this email
+    db_execute("DELETE FROM password_otps WHERE email = %s", (user["email"],))
+    
+    return {
+        "status": "success",
+        "message": "Password reset successfully"
+    }
 
 @app.post("/login")
 def login(req: LoginRequest):
@@ -3139,6 +3423,175 @@ def seed_admin():
         print(f"Error seeding admin: {e}")
 
 seed_admin()
+
+# --- AI Assistant Endpoints ---
+
+class AISegmentRequest(BaseModel):
+    criteria: str
+
+class AISummarizeRequest(BaseModel):
+    lead_id: int
+
+class AIVisualizeRequest(BaseModel):
+    focus: str
+
+@app.post("/ai/segment")
+def ai_segment(req: AISegmentRequest, current_user: dict = Depends(get_current_user)):
+    try:
+        leads = db_query("""
+            SELECT l.id, c.company_name, c.contact_person, l.status, l.priority, 
+                   l.product_type, l.quantity, l.lead_value, c.address as location
+            FROM leads l
+            JOIN customers c ON l.customer_id = c.id
+        """)
+        if not leads:
+            return {
+                "status": "success",
+                "result": {
+                    "segmented_ids": [],
+                    "reasoning": "There are no leads in the database to segment."
+                }
+            }
+        from ai_services import run_segmentation
+        result = run_segmentation(leads, req.criteria)
+        return {"status": "success", "result": result}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/ai/summarize")
+def ai_summarize(req: AISummarizeRequest, current_user: dict = Depends(get_current_user)):
+    try:
+        lead = db_query("""
+            SELECT l.id, c.company_name, c.contact_person, l.status, l.remarks as notes, 
+                   l.priority, l.product_type, l.quantity, l.lead_value, c.phone, c.email
+            FROM leads l
+            JOIN customers c ON l.customer_id = c.id
+            WHERE l.id = %s
+        """, (req.lead_id,), fetch_one=True)
+        
+        if not lead:
+            raise HTTPException(status_code=404, detail="Lead not found")
+        
+        details = f"""
+Lead ID: {lead['id']}
+Contact: {lead['contact_person']}
+Company: {lead['company_name']}
+Email: {lead['email']}
+Phone: {lead['phone']}
+Product Type: {lead['product_type']}
+Quantity: {lead['quantity']}
+Lead Value: {lead['lead_value']}
+Status: {lead['status']}
+Priority: {lead['priority']}
+Notes: {lead['notes']}
+"""
+        from ai_services import run_summarization
+        summary = run_summarization(details)
+        return {"status": "success", "summary": summary}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/ai/visualize")
+def ai_visualize(req: AIVisualizeRequest, current_user: dict = Depends(get_current_user)):
+    try:
+        raw_data = {}
+        if req.focus == "sales":
+            raw_data["monthly_sales"] = db_query("""
+                SELECT TO_CHAR(created_at, 'YYYY-MM') as month, SUM(total_amount) as total_value, COUNT(id) as order_count
+                FROM orders
+                GROUP BY month
+                ORDER BY month DESC
+                LIMIT 6
+            """)
+            raw_data["deal_stages"] = db_query("""
+                SELECT status, SUM(total_amount) as total_value, COUNT(id) as deal_count
+                FROM orders
+                GROUP BY status
+            """)
+            if not raw_data["monthly_sales"] and not raw_data["deal_stages"]:
+                raise HTTPException(status_code=400, detail="No orders or deals found in the CRM database to generate charts.")
+        elif req.focus == "inventory":
+            raw_data["stock_levels"] = db_query("""
+                SELECT COALESCE(rm.name, p.name) as item_name, current_stock, minimum_stock, category
+                FROM inventory i
+                LEFT JOIN raw_materials rm ON i.raw_material_id = rm.id
+                LEFT JOIN products p ON i.product_id = p.id
+                LIMIT 10
+            """)
+            if not raw_data["stock_levels"]:
+                raise HTTPException(status_code=400, detail="No inventory items found in the CRM database to generate charts.")
+        elif req.focus == "production":
+            raw_data["production_status"] = db_query("""
+                SELECT status, COUNT(*) as count
+                FROM orders
+                GROUP BY status
+            """)
+            if not raw_data["production_status"]:
+                raise HTTPException(status_code=400, detail="No active orders found in the CRM database to generate charts.")
+        else:
+            raise HTTPException(status_code=400, detail="Invalid focus type. Select 'sales', 'inventory', or 'production'.")
+        
+        from ai_services import run_visualization
+        result = run_visualization(raw_data, req.focus)
+        return {"status": "success", "result": result}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/ai/sales-report")
+def ai_sales_report(current_user: dict = Depends(get_current_user)):
+    try:
+        sales_stats = {}
+        pipeline = db_query("SELECT SUM(total_amount) as total, COUNT(*) as count FROM orders", fetch_one=True)
+        sales_stats["pipeline"] = {
+            "total_amount": float(pipeline["total"]) if pipeline and pipeline["total"] else 0.0, 
+            "total_deals": pipeline["count"] if pipeline else 0
+        }
+        
+        sales_stats["stages"] = db_query("SELECT status, SUM(total_amount) as total, COUNT(*) as count FROM orders GROUP BY status")
+        for s in sales_stats["stages"]:
+            if s["total"]:
+                s["total"] = float(s["total"])
+        
+        sales_stats["high_value_orders"] = db_query("""
+            SELECT o.order_number, c.company_name, o.total_amount, o.status, o.expected_delivery_date
+            FROM orders o
+            JOIN customers c ON o.customer_id = c.id
+            ORDER BY o.total_amount DESC
+            LIMIT 5
+        """)
+        for o in sales_stats["high_value_orders"]:
+            if o["total_amount"]:
+                o["total_amount"] = float(o["total_amount"])
+        
+        sales_stats["low_stock_items"] = db_query("""
+            SELECT COALESCE(rm.name, p.name) as item_name, current_stock, minimum_stock
+            FROM inventory i
+            LEFT JOIN raw_materials rm ON i.raw_material_id = rm.id
+            LEFT JOIN products p ON i.product_id = p.id
+            WHERE current_stock < minimum_stock
+        """)
+        for i in sales_stats["low_stock_items"]:
+            if i["current_stock"]:
+                i["current_stock"] = float(i["current_stock"])
+            if i["minimum_stock"]:
+                i["minimum_stock"] = float(i["minimum_stock"])
+        
+        sales_stats["invoices"] = db_query("""
+            SELECT payment_status, SUM(total_amount) as total, COUNT(*) as count 
+            FROM invoices 
+            GROUP BY payment_status
+        """)
+        for inv in sales_stats["invoices"]:
+            if inv["total"]:
+                inv["total"] = float(inv["total"])
+        
+        from ai_services import run_sales_report
+        report = run_sales_report(sales_stats)
+        return {"status": "success", "report": report}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 if __name__ == "__main__":
     uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)

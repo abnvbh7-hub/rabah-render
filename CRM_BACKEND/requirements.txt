@@ -7,4 +7,7 @@ PyJWT
 python-dotenv
 pydantic
 firebase-admin
+langchain
+langchain-core
+langchain-groq
 
