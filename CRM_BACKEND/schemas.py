@@ -222,8 +222,11 @@ class EmployeeConvertRequest(BaseModel):
 class ForgotPasswordRequest(BaseModel):
     employee_id: str
 
-class ResetPasswordRequest(BaseModel):
-    employee_id: str
-    otp: str
+class ChangePasswordRequest(BaseModel):
+    current_password: str
     new_password: str
+
+class ApprovePasswordChangeRequest(BaseModel):
+    new_password: str
+
 

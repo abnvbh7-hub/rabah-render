@@ -64,7 +64,8 @@ from schemas import (
     PinLocationRequest,
     EmployeeConvertRequest,
     ForgotPasswordRequest,
-    ResetPasswordRequest,
+    ChangePasswordRequest,
+    ApprovePasswordChangeRequest,
 )
 
 dotenv.load_dotenv()
@@ -111,15 +112,19 @@ try:
     db_execute("ALTER TABLE employee_leads ADD COLUMN IF NOT EXISTS resume_data BYTEA;")
     db_execute("ALTER TABLE employee_leads ADD COLUMN IF NOT EXISTS resume_filename VARCHAR(255);")
     db_execute("""
-    CREATE TABLE IF NOT EXISTS password_otps (
+    CREATE TABLE IF NOT EXISTS password_change_requests (
         id SERIAL PRIMARY KEY,
-        email VARCHAR(255) NOT NULL,
-        otp VARCHAR(6) NOT NULL,
-        expires_at TIMESTAMP NOT NULL,
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+        employee_id VARCHAR(50) NOT NULL,
+        name VARCHAR(255) NOT NULL,
+        email VARCHAR(255),
+        status VARCHAR(50) DEFAULT 'pending',
+        new_assigned_password TEXT,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     );
     """)
-    print("Notifications, user_devices, employee_leads, password_otps tables, in_stock and biometric_id columns verified/created.")
+    print("Notifications, user_devices, employee_leads, password_change_requests tables, in_stock and biometric_id columns verified/created.")
 except Exception as e:
     print(f"Error creating database tables or altering: {e}")
 
@@ -604,93 +609,133 @@ def auto_cleanup_forgotten_checkouts(user_id: int):
 
 import random
 
+@app.post("/change-password")
+def change_password(req: ChangePasswordRequest, current_user: dict = Depends(get_current_user)):
+    if not verify_password(req.current_password, current_user["password_hash"]):
+        raise HTTPException(status_code=400, detail="Current password is incorrect")
+    
+    if not req.new_password or len(req.new_password.strip()) == 0:
+        raise HTTPException(status_code=400, detail="New password cannot be empty")
+        
+    new_hash = hash_password(req.new_password)
+    db_execute("UPDATE users SET password_hash = %s WHERE id = %s", (new_hash, current_user["id"]))
+    
+    return {
+        "status": "success",
+        "message": "Password updated successfully"
+    }
+
 @app.post("/forgot-password")
-def forgot_password(req: ForgotPasswordRequest):
+def request_password_reset(req: ForgotPasswordRequest):
     user = find_user_by_eid(req.employee_id)
     if not user:
         raise HTTPException(status_code=404, detail="Employee not found with provided ID or Email")
     
-    if not user.get("email"):
-        raise HTTPException(status_code=400, detail="This user does not have a registered email address")
-    
-    # Generate 6-digit OTP
-    otp = f"{random.randint(100000, 999999)}"
-    expires_at = get_now_ist() + timedelta(minutes=10)
-    
-    # Insert OTP
-    db_execute(
-        "INSERT INTO password_otps (email, otp, expires_at) VALUES (%s, %s, %s)",
-        (user["email"], otp, expires_at)
-    )
-    
-    # Send email
-    try:
-        from mail import send_email
-        email_body = f"""
-        <html>
-            <body style="font-family: Arial, sans-serif; color: #333; line-height: 1.6; padding: 20px;">
-                <div style="max-width: 500px; margin: 0 auto; border: 1px solid #e2e8f0; border-radius: 12px; padding: 24px; box-shadow: 0 4px 6px -1px rgba(0,0,0,0.1);">
-                    <h2 style="color: #4f46e5; margin-top: 0;">Password Reset OTP</h2>
-                    <p>You requested a password reset for your Papyrus CRM account.</p>
-                    <div style="background: #f1f5f9; padding: 16px; border-radius: 8px; text-align: center; font-size: 24px; font-weight: bold; letter-spacing: 4px; color: #1e293b; margin: 20px 0;">
-                        {otp}
-                    </div>
-                    <p style="font-size: 13px; color: #64748b;">This OTP is valid for 10 minutes. If you did not make this request, please ignore this email.</p>
-                </div>
-            </body>
-        </html>
-        """
-        send_email(user["email"], "Papyrus CRM Password Reset OTP", email_body)
-    except Exception as e:
-        print(f"Error sending password reset email: {e}")
-        raise HTTPException(status_code=500, detail="Failed to send OTP email")
-    
-    # Obfuscate email for security response (e.g. a***b@domain.com)
-    email_parts = user["email"].split("@")
-    if len(email_parts) == 2:
-        name_part, domain_part = email_parts[0], email_parts[1]
-        obfuscated_name = name_part[0] + "*" * (len(name_part) - 2) + name_part[-1] if len(name_part) > 2 else name_part[0] + "*"
-        obfuscated_email = f"{obfuscated_name}@{domain_part}"
-    else:
-        obfuscated_email = user["email"]
-        
-    return {
-        "status": "success",
-        "message": "OTP has been sent to your registered email",
-        "email": obfuscated_email
-    }
-
-@app.post("/reset-password")
-def reset_password(req: ResetPasswordRequest):
-    user = find_user_by_eid(req.employee_id)
-    if not user:
-        raise HTTPException(status_code=404, detail="Employee not found")
-        
-    if not user.get("email"):
-        raise HTTPException(status_code=400, detail="Employee has no email registered")
-        
-    # Verify latest OTP
-    now = get_now_ist()
-    otp_row = db_query(
-        "SELECT * FROM password_otps WHERE email = %s AND expires_at > %s ORDER BY id DESC LIMIT 1",
-        (user["email"], now),
+    # Check if there is already a pending password change request for this user
+    existing_pending = db_query(
+        "SELECT id FROM password_change_requests WHERE user_id = %s AND status = 'pending'",
+        (user["id"],),
         fetch_one=True
     )
     
-    if not otp_row or otp_row["otp"] != req.otp:
-        raise HTTPException(status_code=400, detail="Invalid or expired OTP")
-        
-    # Update password
-    pw_hash = hash_password(req.new_password)
-    db_execute("UPDATE users SET password_hash = %s WHERE id = %s", (pw_hash, user["id"]))
+    if not existing_pending:
+        db_execute(
+            """
+            INSERT INTO password_change_requests (user_id, employee_id, name, email, status)
+            VALUES (%s, %s, %s, %s, 'pending')
+            """,
+            (user["id"], user["employee_id"] or str(user["id"]), user["name"], user["email"])
+        )
     
-    # Clean up OTPs for this email
-    db_execute("DELETE FROM password_otps WHERE email = %s", (user["email"],))
+    # Notify Admin and HR via in-app & email oversight
+    admins_hrs = db_query(
+        """
+        SELECT u.id FROM users u
+        JOIN roles r ON u.role_id = r.id
+        WHERE r.role_name IN ('ADMIN', 'HR')
+        """
+    )
+    for admin_hr in admins_hrs:
+        notify_user(
+            user_id=admin_hr["id"],
+            title="Password Change Request",
+            message=f"Employee {user['name']} ({user['employee_id']}) has requested a password reset.",
+            type_str="password_request"
+        )
     
     return {
         "status": "success",
-        "message": "Password reset successfully"
+        "message": "Password change request sent to Admin & HR successfully. Please contact your Admin or HR to get your new password."
     }
+
+@app.get("/password-change-requests")
+def list_password_change_requests(current_user: dict = Depends(RoleChecker(["admin", "hr"]))):
+    requests = db_query(
+        """
+        SELECT id, user_id, employee_id, name, email, status, new_assigned_password, created_at, updated_at
+        FROM password_change_requests
+        ORDER BY id DESC
+        """
+    )
+    return {"status": "success", "requests": requests}
+
+@app.post("/password-change-requests/{request_id}/approve")
+def approve_password_change_request(
+    request_id: int,
+    req: ApprovePasswordChangeRequest,
+    current_user: dict = Depends(RoleChecker(["admin", "hr"]))
+):
+    req_row = db_query("SELECT * FROM password_change_requests WHERE id = %s", (request_id,), fetch_one=True)
+    if not req_row:
+        raise HTTPException(status_code=404, detail="Password change request not found")
+    
+    if req_row["status"] != "pending":
+        raise HTTPException(status_code=400, detail=f"Request is already {req_row['status']}")
+    
+    if not req.new_password or len(req.new_password.strip()) == 0:
+        raise HTTPException(status_code=400, detail="New password cannot be empty")
+    
+    # Hash and update user's password in users table
+    new_hash = hash_password(req.new_password)
+    db_execute("UPDATE users SET password_hash = %s WHERE id = %s", (new_hash, req_row["user_id"]))
+    
+    # Mark request as approved
+    now = get_now_ist()
+    db_execute(
+        "UPDATE password_change_requests SET status = 'approved', new_assigned_password = %s, updated_at = %s WHERE id = %s",
+        (req.new_password, now, request_id)
+    )
+    
+    # Send notification to the user whose password was reset
+    notify_user(
+        user_id=req_row["user_id"],
+        title="Password Reset Approved",
+        message=f"Your password change request has been approved by {current_user['name']}. Your new password is: {req.new_password}",
+        type_str="password_approved"
+    )
+    
+    return {
+        "status": "success",
+        "message": "Password change request accepted and new password assigned successfully"
+    }
+
+@app.post("/password-change-requests/{request_id}/reject")
+def reject_password_change_request(
+    request_id: int,
+    current_user: dict = Depends(RoleChecker(["admin", "hr"]))
+):
+    req_row = db_query("SELECT * FROM password_change_requests WHERE id = %s", (request_id,), fetch_one=True)
+    if not req_row:
+        raise HTTPException(status_code=404, detail="Password change request not found")
+    
+    now = get_now_ist()
+    db_execute(
+        "UPDATE password_change_requests SET status = 'rejected', updated_at = %s WHERE id = %s",
+        (now, request_id)
+    )
+    
+    return {"status": "success", "message": "Password change request rejected"}
+
 
 @app.post("/login")
 def login(req: LoginRequest):
