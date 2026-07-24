@@ -380,6 +380,10 @@ def signup(req: SignupRequest, current_user: dict = Depends(RoleChecker(["admin"
         prefix = "ADM"
     elif role_upper == "SALES":
         prefix = "SAL"
+    elif role_upper == "SALES MANAGER":
+        prefix = "SLM"
+    elif role_upper == "FACTORY MANAGER":
+        prefix = "FTM"
     elif role_upper == "INVENTORY":
         prefix = "INV"
     elif role_upper == "PRODUCTION":
@@ -541,6 +545,10 @@ def convert_employee_lead(id: int, req: EmployeeConvertRequest, current_user: di
         prefix = "ADM"
     elif role_upper == "SALES":
         prefix = "SAL"
+    elif role_upper == "SALES MANAGER":
+        prefix = "SLM"
+    elif role_upper == "FACTORY MANAGER":
+        prefix = "FTM"
     elif role_upper == "INVENTORY":
         prefix = "INV"
     elif role_upper == "PRODUCTION":
@@ -859,6 +867,8 @@ def get_dashboard_stats(current_user: dict = Depends(get_current_user)):
 
     today_checkins = db_query("SELECT COUNT(*) as cnt FROM attendance WHERE date = CURRENT_DATE", fetch_one=True)["cnt"]
 
+    is_fac_mgr = (role == "factory manager")
+
     return {
         "status": "success",
         "role": role,
@@ -866,14 +876,14 @@ def get_dashboard_stats(current_user: dict = Depends(get_current_user)):
             "total_leads": total_leads,
             "converted_leads": converted_leads,
             "active_leads": active_leads,
-            "total_sales": float(total_sales),
+            "total_sales": 0.0 if is_fac_mgr else float(total_sales),
             "low_stock_count": low_stock_count,
             "pending_pr_count": pending_pr_count,
             "active_employees": active_employees,
             "total_customers": total_customers,
-            "total_receivables": float(total_receivables),
-            "payments_received": float(payments_received),
-            "outstanding_balance": float(outstanding_balance)
+            "total_receivables": 0.0 if is_fac_mgr else float(total_receivables),
+            "payments_received": 0.0 if is_fac_mgr else float(payments_received),
+            "outstanding_balance": 0.0 if is_fac_mgr else float(outstanding_balance)
         },
         "sales_stats": {
             "my_total_leads": my_total_leads,
@@ -1039,7 +1049,16 @@ def delete_user(employee_id: str, current_user: dict = Depends(RoleChecker(["adm
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
 
-    db_execute("DELETE FROM users WHERE id = %s", (user["id"],))
+    user_id = user["id"]
+    # Clean up foreign key references to avoid constraint violations
+    db_execute("DELETE FROM attendance WHERE user_id = %s", (user_id,))
+    db_execute("DELETE FROM employee_locations WHERE user_id = %s", (user_id,))
+    db_execute("UPDATE leads SET assigned_sales_id = NULL WHERE assigned_sales_id = %s", (user_id,))
+    db_execute("UPDATE leads SET created_by = NULL WHERE created_by = %s", (user_id,))
+    db_execute("UPDATE purchase_requests SET requested_by = NULL WHERE requested_by = %s", (user_id,))
+    db_execute("UPDATE purchase_requests SET approved_by = NULL WHERE approved_by = %s", (user_id,))
+
+    db_execute("DELETE FROM users WHERE id = %s", (user_id,))
     return {"status": "success", "message": "User deleted successfully"}
 
 @app.post("/checkin")
@@ -1451,6 +1470,7 @@ def list_customers(current_user: dict = Depends(get_current_user)):
                 "color": l["color"],
                 "gsm": l["gsm"],
                 "quantity": l["quantity"],
+                "lead_value": 0.0 if role == "factory manager" else (float(l["lead_value"]) if l["lead_value"] is not None else 0.0),
                 "remarks": l["remarks"],
                 "is_verified": is_verified,
                 "is_converted": is_converted,
@@ -1470,8 +1490,8 @@ def list_customers(current_user: dict = Depends(get_current_user)):
                 "color": o["color"],
                 "gsm": o["gsm"],
                 "quantity": o["quantity"],
-                "unit_price": float(o["unit_price"]) if o["unit_price"] else 0.0,
-                "total_amount": float(o["total_amount"]) if o["total_amount"] else 0.0,
+                "unit_price": 0.0 if role == "factory manager" else (float(o["unit_price"]) if o["unit_price"] else 0.0),
+                "total_amount": 0.0 if role == "factory manager" else (float(o["total_amount"]) if o["total_amount"] else 0.0),
                 "status": approval_status,
                 "stage": stage,
                 "created_at": format_dt(o["created_at"])
@@ -1530,7 +1550,7 @@ def list_leads(current_user: dict = Depends(get_current_user)):
             "color": l["color"],
             "gsm": l["gsm"],
             "quantity": l["quantity"],
-            "lead_value": float(l["lead_value"]) if l["lead_value"] is not None else 0.0,
+            "lead_value": 0.0 if role == "factory manager" else (float(l["lead_value"]) if l["lead_value"] is not None else 0.0),
             "handles": l["handles"],
             "print_color": l["print_color"],
             "bag_type": l["bag_type"],
@@ -2108,6 +2128,7 @@ def list_deals(current_user: dict = Depends(get_current_user)):
         orders = db_query(query)
 
     formatted = []
+    is_fac_mgr = (role == "factory manager")
     for o in orders:
         stage, approval_status = parse_order_status(o["order_status"])
 
@@ -2121,7 +2142,7 @@ def list_deals(current_user: dict = Depends(get_current_user)):
             "contact_name": o["contact_person"],
             "phone": o["phone"],
             "email": o["email"],
-            "deal_value": float(o["total_amount"]) if o["total_amount"] else 0.0,
+            "deal_value": 0.0 if is_fac_mgr else (float(o["total_amount"]) if o["total_amount"] else 0.0),
             "stage": stage,
             "status": approval_status,
             "note": f"Product: {o['product_type']}, Qty: {o['quantity']}",
@@ -2136,9 +2157,9 @@ def list_deals(current_user: dict = Depends(get_current_user)):
             "handles": o["handles"],
             "print_color": o["print_color"],
             "bag_type": o["bag_type"],
-            "unit_price": float(o["unit_price"]) if o["unit_price"] else 0.0,
-            "advance_received": float(o["advance_received"]) if o["advance_received"] else 0.0,
-            "balance_amount": float(o["balance_amount"]) if o["balance_amount"] else 0.0,
+            "unit_price": 0.0 if is_fac_mgr else (float(o["unit_price"]) if o["unit_price"] else 0.0),
+            "advance_received": 0.0 if is_fac_mgr else (float(o["advance_received"]) if o["advance_received"] else 0.0),
+            "balance_amount": 0.0 if is_fac_mgr else (float(o["balance_amount"]) if o["balance_amount"] else 0.0),
             "expected_delivery_date": o["expected_delivery_date"].isoformat() if o["expected_delivery_date"] else None,
             "production_status": o["production_status"] or "N/A",
             "production_expected_date": o["production_expected_date"].isoformat() if o["production_expected_date"] else None,
@@ -2464,7 +2485,7 @@ def reject_deal(id: int, current_user: dict = Depends(RoleChecker(["admin"]))):
 def update_deal_inventory_status(id: int, status: str = Query(...), current_user: dict = Depends(get_current_user)):
     uid = current_user["id"]
     role = current_user["role"].lower()
-    if role not in ["admin", "inventory"]:
+    if role not in ["admin", "inventory", "factory manager"]:
         raise HTTPException(status_code=403, detail="Access denied")
 
     order = db_query("SELECT * FROM orders WHERE id = %s", (id,), fetch_one=True)
@@ -2546,7 +2567,7 @@ def get_locked_inventory(current_user: dict = Depends(get_current_user)):
     return {"status": "success", "locked_inventory": formatted}
 
 @app.post("/inventory/item")
-def create_inventory_item(req: InventoryItemCreate, current_user: dict = Depends(RoleChecker(["admin", "inventory"]))):
+def create_inventory_item(req: InventoryItemCreate, current_user: dict = Depends(RoleChecker(["admin", "inventory", "factory manager"]))):
     uid = current_user["id"]
     category_norm = "Raw Material" if req.category.lower().startswith("raw") else "Indents"
     
@@ -2592,7 +2613,7 @@ def create_inventory_item(req: InventoryItemCreate, current_user: dict = Depends
     return {"status": "success", "message": "Inventory item created", "id": item_id}
 
 @app.put("/inventory/item/{id}")
-def update_inventory_item(id: int, req: InventoryItemUpdate, current_user: dict = Depends(RoleChecker(["admin", "inventory"]))):
+def update_inventory_item(id: int, req: InventoryItemUpdate, current_user: dict = Depends(RoleChecker(["admin", "inventory", "factory manager"]))):
     uid = current_user["id"]
     item = db_query("SELECT * FROM inventory WHERE id = %s", (id,), fetch_one=True)
     if not item:
@@ -2780,7 +2801,7 @@ def list_production_records(current_user: dict = Depends(get_current_user)):
     return {"status": "success", "production": formatted}
 
 @app.put("/production/{id}")
-def update_production_status(id: int, req: ProductionUpdate, current_user: dict = Depends(RoleChecker(["admin", "production"]))):
+def update_production_status(id: int, req: ProductionUpdate, current_user: dict = Depends(RoleChecker(["admin", "production", "factory manager"]))):
     prod = db_query("SELECT * FROM production WHERE id = %s", (id,), fetch_one=True)
     if not prod:
         raise HTTPException(status_code=404, detail="Production record not found")
