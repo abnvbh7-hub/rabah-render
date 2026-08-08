@@ -27,10 +27,10 @@ class PinLocationRequest(BaseModel):
 
 
 class LeadCreate(BaseModel):
-    name: str
+    name: Optional[str] = None
     email: Optional[str] = None
-    phone: str
-    company_name: str
+    phone: Optional[str] = None
+    company_name: Optional[str] = None
     status: Optional[str] = "pending"
     note: Optional[str] = None
     source: Optional[str] = "Manual"
@@ -45,15 +45,16 @@ class LeadCreate(BaseModel):
     handles: Optional[str] = None
     print_color: Optional[str] = None
     bag_type: Optional[str] = None
+    print_side: Optional[str] = None
     followup_date: Optional[date] = None
     lead_value: Optional[Decimal] = None
     expected_delivery_date: Optional[date] = None
 
 class LeadUpdate(BaseModel):
-    name: str
+    name: Optional[str] = None
     email: Optional[str] = None
-    phone: str
-    company_name: str
+    phone: Optional[str] = None
+    company_name: Optional[str] = None
     status: str
     note: Optional[str] = None
     source: Optional[str] = "Manual"
@@ -68,6 +69,7 @@ class LeadUpdate(BaseModel):
     handles: Optional[str] = None
     print_color: Optional[str] = None
     bag_type: Optional[str] = None
+    print_side: Optional[str] = None
     followup_date: Optional[date] = None
     lead_value: Optional[Decimal] = None
     expected_delivery_date: Optional[date] = None
@@ -94,6 +96,7 @@ class DealCreate(BaseModel):
     handles: Optional[str] = None
     print_color: Optional[str] = None
     bag_type: Optional[str] = None
+    print_side: Optional[str] = None
     location: Optional[str] = None
     priority: Optional[str] = None
     followup_date: Optional[date] = None
@@ -106,7 +109,7 @@ class DealUpdate(BaseModel):
     email: Optional[str] = ""
     deal_value: Decimal = 0
     source: Optional[str] = ""
-    note: Optional[str] = ""
+    note: Optional[str] = None
     assigned_to: Optional[str] = None
     product_type: Optional[str] = None
     size: Optional[str] = None
@@ -120,6 +123,7 @@ class DealUpdate(BaseModel):
     handles: Optional[str] = None
     print_color: Optional[str] = None
     bag_type: Optional[str] = None
+    print_side: Optional[str] = None
     location: Optional[str] = None
     priority: Optional[str] = None
     followup_date: Optional[date] = None
@@ -136,6 +140,7 @@ class LeadConvertRequest(BaseModel):
     handles: Optional[str] = None
     print_color: Optional[str] = None
     bag_type: Optional[str] = None
+    print_side: Optional[str] = None
     expected_delivery_date: Optional[date] = None
 
 class InventoryItemCreate(BaseModel):
@@ -172,8 +177,11 @@ class InvoiceCreate(BaseModel):
     total_amount: Decimal
     payment_status: Optional[str] = "PENDING"
 
+from typing import Optional, List, Union
+
 class InvoicePaymentUpdate(BaseModel):
-    payment_status: str
+    payment_status: Optional[str] = None
+    amount_received: Optional[Union[float, Decimal, str]] = None
 
 class CustomerCreate(BaseModel):
     company_name: Optional[str] = None
@@ -218,6 +226,7 @@ class EmployeeConvertRequest(BaseModel):
     email: Optional[str] = None
     phone: Optional[str] = None
     role: Optional[str] = None
+    employee_id: Optional[str] = None
 
 class ForgotPasswordRequest(BaseModel):
     employee_id: str

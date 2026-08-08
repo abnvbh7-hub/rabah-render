@@ -40,6 +40,7 @@ from auth import (
     verify_password,
     create_access_token,
     get_current_user,
+    get_optional_current_user,
     RoleChecker,
 )
 from schemas import (
@@ -97,6 +98,21 @@ try:
     """)
     db_execute("ALTER TABLE orders ADD COLUMN IF NOT EXISTS in_stock BOOLEAN DEFAULT FALSE;")
     db_execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS biometric_id VARCHAR(50);")
+    try:
+        db_execute("ALTER TABLE customers ALTER COLUMN contact_person DROP NOT NULL;")
+        db_execute("ALTER TABLE customers ALTER COLUMN phone DROP NOT NULL;")
+    except Exception as e:
+        print(f"Error dropping NOT NULL on customers columns: {e}")
+    try:
+        db_execute("ALTER TABLE leads ADD COLUMN IF NOT EXISTS print_side VARCHAR(50);")
+        db_execute("ALTER TABLE orders ADD COLUMN IF NOT EXISTS print_side VARCHAR(50);")
+    except Exception as e:
+        print(f"Error adding print_side column: {e}")
+    try:
+        db_execute("UPDATE leads SET status = 'HOT' WHERE status = 'PENDING_HOT';")
+        db_execute("UPDATE leads SET status = 'COLD' WHERE status = 'PENDING_COLD' OR status = 'pending' OR status IS NULL;")
+    except Exception as e:
+        print(f"Error migrating pending leads: {e}")
     db_execute("""
     CREATE TABLE IF NOT EXISTS employee_leads (
         id SERIAL PRIMARY KEY,
@@ -347,65 +363,77 @@ def map_status_from_db(db_status: str) -> str:
 
 def find_user_by_eid(eid: str):
     """Find user by employee_id, email, phone, or numeric id."""
+    cleaned_eid = eid.strip()
 
-    user = db_query("SELECT u.*, r.role_name as role FROM users u LEFT JOIN roles r ON u.role_id = r.id WHERE u.employee_id = %s", (eid,), fetch_one=True)
+    # 1. Case-insensitive lookup by employee_id
+    user = db_query("SELECT u.*, r.role_name as role FROM users u LEFT JOIN roles r ON u.role_id = r.id WHERE LOWER(u.employee_id) = LOWER(%s)", (cleaned_eid,), fetch_one=True)
     if user:
         return user
 
-    user = db_query("SELECT u.*, r.role_name as role FROM users u LEFT JOIN roles r ON u.role_id = r.id WHERE u.email = %s", (eid,), fetch_one=True)
+    # 2. Case-insensitive lookup by email
+    user = db_query("SELECT u.*, r.role_name as role FROM users u LEFT JOIN roles r ON u.role_id = r.id WHERE LOWER(u.email) = LOWER(%s)", (cleaned_eid,), fetch_one=True)
     if user:
         return user
 
-    user = db_query("SELECT u.*, r.role_name as role FROM users u LEFT JOIN roles r ON u.role_id = r.id WHERE u.phone = %s", (eid,), fetch_one=True)
+    # 3. Lookup by phone
+    user = db_query("SELECT u.*, r.role_name as role FROM users u LEFT JOIN roles r ON u.role_id = r.id WHERE u.phone = %s", (cleaned_eid,), fetch_one=True)
     if user:
         return user
 
-    digits = "".join([c for c in eid if c.isdigit()])
-    if digits:
-        user = db_query("SELECT u.*, r.role_name as role FROM users u LEFT JOIN roles r ON u.role_id = r.id WHERE u.id = %s", (int(digits),), fetch_one=True)
+    # 4. Lookup by numeric id if input is purely numeric
+    if cleaned_eid.isdigit():
+        user = db_query("SELECT u.*, r.role_name as role FROM users u LEFT JOIN roles r ON u.role_id = r.id WHERE u.id = %s", (int(cleaned_eid),), fetch_one=True)
         if user:
             return user
     return None
 
 @app.post("/signup")
-def signup(req: SignupRequest, current_user: dict = Depends(RoleChecker(["admin", "hr"]))):
+def signup(req: SignupRequest, current_user: Optional[dict] = Depends(get_optional_current_user)):
 
     existing = db_query("SELECT id FROM users WHERE email = %s", (req.email,), fetch_one=True)
     if existing:
         raise HTTPException(status_code=400, detail="Email already registered")
 
     role_upper = req.role.upper()
-    prefix = "EMP"
-    if role_upper == "ADMIN":
-        prefix = "ADM"
-    elif role_upper == "SALES":
-        prefix = "SAL"
-    elif role_upper == "SALES MANAGER":
-        prefix = "SLM"
-    elif role_upper == "FACTORY MANAGER":
-        prefix = "FTM"
-    elif role_upper == "INVENTORY":
-        prefix = "INV"
-    elif role_upper == "PRODUCTION":
-        prefix = "PRD"
-    elif role_upper == "HR":
-        prefix = "HR"
-    elif role_upper == "ACCOUNTANT":
-        prefix = "ACC"
 
-    existing_ids = db_query("SELECT employee_id FROM users WHERE employee_id LIKE %s", (f"{prefix}%",))
-    numbers = []
-    for item in existing_ids:
-        eid = item["employee_id"]
-        if eid:
-            digit_part = "".join([char for char in eid if char.isdigit()])
-            if digit_part:
-                try:
-                    numbers.append(int(digit_part))
-                except ValueError:
-                    pass
-    next_num = max(numbers) + 1 if numbers else 1
-    generated_eid = f"{prefix}{next_num:03d}"
+    if req.employee_id and req.employee_id.strip():
+        chosen_eid = req.employee_id.strip()
+        existing_eid = db_query("SELECT id FROM users WHERE employee_id = %s", (chosen_eid,), fetch_one=True)
+        if existing_eid:
+            raise HTTPException(status_code=400, detail="Employee ID already exists")
+        generated_eid = chosen_eid
+    else:
+        prefix = "EMP"
+        if role_upper == "ADMIN":
+            prefix = "ADM"
+        elif role_upper == "SALES":
+            prefix = "SAL"
+        elif role_upper == "SALES MANAGER":
+            prefix = "SLM"
+        elif role_upper == "FACTORY MANAGER":
+            prefix = "FTM"
+        elif role_upper == "INVENTORY":
+            prefix = "INV"
+        elif role_upper == "PRODUCTION":
+            prefix = "PRD"
+        elif role_upper == "HR":
+            prefix = "HR"
+        elif role_upper == "ACCOUNTANT":
+            prefix = "ACC"
+
+        existing_ids = db_query("SELECT employee_id FROM users WHERE employee_id LIKE %s", (f"{prefix}%",))
+        numbers = []
+        for item in existing_ids:
+            eid = item["employee_id"]
+            if eid:
+                digit_part = "".join([char for char in eid if char.isdigit()])
+                if digit_part:
+                    try:
+                        numbers.append(int(digit_part))
+                    except ValueError:
+                        pass
+        next_num = max(numbers) + 1 if numbers else 1
+        generated_eid = f"{prefix}{next_num:03d}"
 
     pw_hash = hash_password(req.password)
 
@@ -539,38 +567,45 @@ def convert_employee_lead(id: int, req: EmployeeConvertRequest, current_user: di
     if existing:
         raise HTTPException(status_code=400, detail="An employee with this email is already registered")
     
-    role_upper = lead_role.upper()
-    prefix = "EMP"
-    if role_upper == "ADMIN":
-        prefix = "ADM"
-    elif role_upper == "SALES":
-        prefix = "SAL"
-    elif role_upper == "SALES MANAGER":
-        prefix = "SLM"
-    elif role_upper == "FACTORY MANAGER":
-        prefix = "FTM"
-    elif role_upper == "INVENTORY":
-        prefix = "INV"
-    elif role_upper == "PRODUCTION":
-        prefix = "PRD"
-    elif role_upper == "HR":
-        prefix = "HR"
-    elif role_upper == "ACCOUNTANT":
-        prefix = "ACC"
+    if req.employee_id and req.employee_id.strip():
+        chosen_eid = req.employee_id.strip()
+        existing_eid = db_query("SELECT id FROM users WHERE employee_id = %s", (chosen_eid,), fetch_one=True)
+        if existing_eid:
+            raise HTTPException(status_code=400, detail="Employee ID already exists")
+        generated_eid = chosen_eid
+    else:
+        role_upper = lead_role.upper()
+        prefix = "EMP"
+        if role_upper == "ADMIN":
+            prefix = "ADM"
+        elif role_upper == "SALES":
+            prefix = "SAL"
+        elif role_upper == "SALES MANAGER":
+            prefix = "SLM"
+        elif role_upper == "FACTORY MANAGER":
+            prefix = "FTM"
+        elif role_upper == "INVENTORY":
+            prefix = "INV"
+        elif role_upper == "PRODUCTION":
+            prefix = "PRD"
+        elif role_upper == "HR":
+            prefix = "HR"
+        elif role_upper == "ACCOUNTANT":
+            prefix = "ACC"
 
-    existing_ids = db_query("SELECT employee_id FROM users WHERE employee_id LIKE %s", (f"{prefix}%",))
-    numbers = []
-    for item in existing_ids:
-        eid = item["employee_id"]
-        if eid:
-            digit_part = "".join([char for char in eid if char.isdigit()])
-            if digit_part:
-                try:
-                    numbers.append(int(digit_part))
-                except ValueError:
-                    pass
-    next_num = max(numbers) + 1 if numbers else 1
-    generated_eid = f"{prefix}{next_num:03d}"
+        existing_ids = db_query("SELECT employee_id FROM users WHERE employee_id LIKE %s", (f"{prefix}%",))
+        numbers = []
+        for item in existing_ids:
+            eid = item["employee_id"]
+            if eid:
+                digit_part = "".join([char for char in eid if char.isdigit()])
+                if digit_part:
+                    try:
+                        numbers.append(int(digit_part))
+                    except ValueError:
+                        pass
+        next_num = max(numbers) + 1 if numbers else 1
+        generated_eid = f"{prefix}{next_num:03d}"
 
     pw_hash = hash_password(req.password)
 
@@ -1506,7 +1541,7 @@ def list_leads(current_user: dict = Depends(get_current_user)):
 
     query = """
         SELECT l.id, l.customer_id, l.assigned_sales_id, l.created_by, l.status, l.priority, l.product_type, l.size, l.color, l.gsm, l.quantity, l.remarks, l.created_at,
-               l.handles, l.print_color, l.bag_type, l.followup_date, l.lead_value, l.expected_delivery_date,
+               l.handles, l.print_color, l.bag_type, l.print_side, l.followup_date, l.lead_value, l.expected_delivery_date,
                c.contact_person, c.company_name, c.email, c.phone, c.address,
                u.name as assigned_name, u.employee_id as assigned_employee_id,
                u2.name as creator_name, u2.employee_id as creator_employee_id
@@ -1526,9 +1561,10 @@ def list_leads(current_user: dict = Depends(get_current_user)):
 
     formatted = []
     for l in leads:
-        frontend_status = map_status_from_db(l["status"])
-        is_verified = not l["status"].startswith("PENDING_")
-        is_converted = l["status"] == "WON"
+        db_status_val = l["status"] or "HOT"
+        frontend_status = map_status_from_db(db_status_val)
+        is_verified = True
+        is_converted = db_status_val == "WON"
 
         formatted.append({
             "id": l["id"],
@@ -1554,6 +1590,7 @@ def list_leads(current_user: dict = Depends(get_current_user)):
             "handles": l["handles"],
             "print_color": l["print_color"],
             "bag_type": l["bag_type"],
+            "print_side": l["print_side"],
             "followup_date": str(l["followup_date"]) if l["followup_date"] else None,
             "expected_delivery_date": str(l["expected_delivery_date"]) if l["expected_delivery_date"] else None,
             "assigned_to": l["assigned_employee_id"] if l["assigned_employee_id"] else "",
@@ -1570,6 +1607,9 @@ def create_lead(req: LeadCreate, current_user: dict = Depends(get_current_user))
     phone_val = req.phone.strip() if req.phone else None
     email_val = req.email.strip() if req.email else None
     company_val = req.company_name.strip() if req.company_name else None
+
+    import random
+    name_val = req.name.strip() if (req.name and req.name.strip()) else f"Lead-{random.randint(1000, 9999)}"
 
     customer = None
     if phone_val or email_val:
@@ -1590,7 +1630,7 @@ def create_lead(req: LeadCreate, current_user: dict = Depends(get_current_user))
         print("DEBUG: updating existing customer id =", cust_id)
         db_execute(
             "UPDATE customers SET company_name = %s, contact_person = %s, address = %s, modified_by = %s, modified_at = CURRENT_TIMESTAMP WHERE id = %s",
-            (req.company_name, req.name, req.location, uid, cust_id)
+            (req.company_name, name_val, req.location, uid, cust_id)
         )
     else:
         print("DEBUG: inserting new customer")
@@ -1599,7 +1639,7 @@ def create_lead(req: LeadCreate, current_user: dict = Depends(get_current_user))
             INSERT INTO customers (company_name, contact_person, phone, email, address, created_by, modified_by)
             VALUES (%s, %s, %s, %s, %s, %s, %s) RETURNING id
             """,
-            (req.company_name, req.name, req.phone, req.email, req.location, uid, uid),
+            (req.company_name, name_val, req.phone, req.email, req.location, uid, uid),
             return_id=True
         )
     print("DEBUG: cust_id =", cust_id)
@@ -1610,18 +1650,11 @@ def create_lead(req: LeadCreate, current_user: dict = Depends(get_current_user))
         if rep:
             assigned_sales_id = rep["id"]
 
-    role = current_user["role"].upper()
-    frontend_status = (req.status or "PENDING_HOT").upper()
-    if role in ["ADMIN", "HR"]:
-        if frontend_status.startswith("PENDING_"):
-            db_status = frontend_status.replace("PENDING_", "")
-        else:
-            db_status = frontend_status if frontend_status in ["HOT", "COLD"] else "HOT"
+    frontend_status = (req.status or "HOT").upper()
+    if frontend_status.startswith("PENDING_"):
+        db_status = frontend_status.replace("PENDING_", "")
     else:
-        if frontend_status in ["HOT", "PENDING_HOT"]:
-            db_status = "PENDING_HOT"
-        else:
-            db_status = "PENDING_COLD"
+        db_status = frontend_status if frontend_status in ["HOT", "COLD", "WON", "LOST"] else "HOT"
 
     expected_delivery_date = req.expected_delivery_date
     if not expected_delivery_date and req.product_type:
@@ -1644,10 +1677,10 @@ def create_lead(req: LeadCreate, current_user: dict = Depends(get_current_user))
     print("DEBUG: executing lead insert")
     lead_id = db_execute(
         """
-        INSERT INTO leads (customer_id, assigned_sales_id, status, remarks, priority, product_type, size, color, gsm, quantity, lead_value, handles, print_color, bag_type, created_by, followup_date, modified_by, expected_delivery_date)
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s) RETURNING id
+        INSERT INTO leads (customer_id, assigned_sales_id, status, remarks, priority, product_type, size, color, gsm, quantity, lead_value, handles, print_color, bag_type, print_side, created_by, followup_date, modified_by, expected_delivery_date)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s) RETURNING id
         """,
-        (cust_id, assigned_sales_id, db_status, req.note, req.priority or "Priority(days)", req.product_type, req.size, req.color, req.gsm, req.quantity, req.lead_value, req.handles, req.print_color, req.bag_type, uid, req.followup_date, uid, expected_delivery_date),
+        (cust_id, assigned_sales_id, db_status, req.note, req.priority or "Priority(days)", req.product_type, req.size, req.color, req.gsm, req.quantity, req.lead_value, req.handles, req.print_color, req.bag_type, req.print_side, uid, req.followup_date, uid, expected_delivery_date),
         return_id=True
     )
     print("DEBUG: lead_id =", lead_id)
@@ -1722,17 +1755,11 @@ def update_lead(id: int, req: LeadUpdate, current_user: dict = Depends(get_curre
         db_status = "WON"
     elif frontend_status in ["WON", "LOST"]:
         db_status = frontend_status
-    elif role in ["ADMIN", "HR"]:
+    else:
         if frontend_status.startswith("PENDING_"):
             db_status = frontend_status.replace("PENDING_", "")
         else:
             db_status = frontend_status if frontend_status in ["HOT", "COLD"] else "HOT"
-    else:
-        was_verified = not lead["status"].startswith("PENDING_")
-        if was_verified:
-            db_status = "HOT" if "HOT" in frontend_status else "COLD"
-        else:
-            db_status = "PENDING_HOT" if "HOT" in frontend_status else "PENDING_COLD"
 
     expected_delivery_date = req.expected_delivery_date
     if not expected_delivery_date and req.product_type:
@@ -1755,11 +1782,11 @@ def update_lead(id: int, req: LeadUpdate, current_user: dict = Depends(get_curre
         UPDATE leads
         SET remarks = %s, status = %s, assigned_sales_id = %s,
             priority = %s, product_type = %s, size = %s, color = %s, gsm = %s, quantity = %s,
-            lead_value = %s, handles = %s, print_color = %s, bag_type = %s, followup_date = %s,
+            lead_value = %s, handles = %s, print_color = %s, bag_type = %s, print_side = %s, followup_date = %s,
             modified_by = %s, modified_at = CURRENT_TIMESTAMP, expected_delivery_date = %s
         WHERE id = %s
         """,
-        (req.note, db_status, assigned_sales_id, req.priority or "Priority(days)", req.product_type, req.size, req.color, req.gsm, req.quantity, req.lead_value, req.handles, req.print_color, req.bag_type, req.followup_date, uid, expected_delivery_date, id)
+        (req.note, db_status, assigned_sales_id, req.priority or "Priority(days)", req.product_type, req.size, req.color, req.gsm, req.quantity, req.lead_value, req.handles, req.print_color, req.bag_type, req.print_side, req.followup_date, uid, expected_delivery_date, id)
     )
 
     # Check if assigned agent has changed or follow-up updated
@@ -1877,19 +1904,19 @@ def deduct_and_lock_inventory(cur, order_id: int, customer_id: int, product_name
         curr_stock = inv_row[1]
         if curr_stock >= Decimal(str(quantity)):
             is_in_stock = True
-        # Deduct stock (can go negative)
+        # Deduct stock (capped at 0 so stock never goes negative)
         cur.execute(
-            "UPDATE inventory SET current_stock = current_stock - %s WHERE id = %s",
+            "UPDATE inventory SET current_stock = GREATEST(0, current_stock - %s) WHERE id = %s",
             (Decimal(str(quantity)), inventory_id)
         )
     else:
-        # Create inventory item with negative stock
+        # Create inventory item with 0 stock (not negative)
         cur.execute(
             """
             INSERT INTO inventory (product_id, category, current_stock, minimum_stock)
-            VALUES (%s, 'Indents', %s, 100) RETURNING id
+            VALUES (%s, 'Indents', 0, 100) RETURNING id
             """,
-            (product_id, -Decimal(str(quantity)))
+            (product_id,)
         )
         inventory_id = cur.fetchone()[0]
 
@@ -1965,9 +1992,7 @@ def convert_lead_to_deal(id: int, req: LeadConvertRequest, current_user: dict = 
     if not lead:
         raise HTTPException(status_code=404, detail="Lead not found")
 
-    frontend_status = map_status_from_db(lead["status"])
-    if frontend_status == "pending":
-        raise HTTPException(status_code=400, detail="Lead must be verified before conversion")
+    # All leads are auto-verified
 
     product_name = req.product_type or lead["product_type"] or "Standard Box"
     qty_needed = Decimal(str(req.quantity))
@@ -2032,8 +2057,8 @@ def convert_lead_to_deal(id: int, req: LeadConvertRequest, current_user: dict = 
 
                     cur.execute(
                         """
-                        INSERT INTO orders (customer_id, lead_id, order_number, product_type, size, color, gsm, quantity, unit_price, total_amount, status, handles, print_color, bag_type, created_by, modified_by, source, priority, followup_date, expected_delivery_date)
-                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                        INSERT INTO orders (customer_id, lead_id, order_number, product_type, size, color, gsm, quantity, unit_price, total_amount, status, handles, print_color, bag_type, print_side, created_by, modified_by, source, priority, followup_date, expected_delivery_date)
+                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                         RETURNING id
                         """,
                         (
@@ -2047,10 +2072,11 @@ def convert_lead_to_deal(id: int, req: LeadConvertRequest, current_user: dict = 
                             req.quantity,
                             req.unit_price,
                             total_val,
-                            "New|Pending Approval",
+                            "New|Approved",
                             req.handles or lead["handles"],
                             req.print_color or lead["print_color"],
                             req.bag_type or lead["bag_type"],
+                            req.print_side or lead["print_side"],
                             uid,
                             uid,
                             lead.get("source") or "Conversion",
@@ -2063,6 +2089,25 @@ def convert_lead_to_deal(id: int, req: LeadConvertRequest, current_user: dict = 
 
                     # Deduct stock and lock inventory
                     deduct_and_lock_inventory(cur, order_id, lead["customer_id"], product_name, req.quantity)
+
+                    # Insert production record since it is auto-approved/verified!
+                    cur.execute(
+                        """
+                        INSERT INTO production (order_id, status, expected_completion_date, created_by, modified_by)
+                        VALUES (%s, 'PENDING', %s, %s, %s)
+                        """,
+                        (order_id, expected_delivery_date, uid, uid)
+                    )
+
+                    # Auto-create invoice so converted lead is immediately visible in Accounts section
+                    inv_number = f"INV-{get_now_ist().strftime('%Y%m%d')}-{order_id}"
+                    cur.execute(
+                        """
+                        INSERT INTO invoices (order_id, invoice_number, subtotal, gst, transport_charge, stereo_charge, total_amount, payment_status)
+                        VALUES (%s, %s, %s, 0, 0, 0, %s, 'PENDING')
+                        """,
+                        (order_id, inv_number, total_val, total_val)
+                    )
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to convert lead atomically: {str(e)}")
 
@@ -2094,7 +2139,7 @@ def list_deals(current_user: dict = Depends(get_current_user)):
         SELECT o.id, o.customer_id, o.lead_id, o.order_number, o.product_type, o.size, o.color, o.gsm,
                o.quantity, o.unit_price, o.total_amount, o.status as order_status, o.created_at,
                o.advance_received, o.balance_amount, o.expected_delivery_date,
-               o.handles, o.print_color, o.bag_type,
+               o.handles, o.print_color, o.bag_type, o.print_side,
                c.company_name, c.contact_person, c.phone, c.email, c.address as location,
                l.assigned_sales_id, l.created_by,
                u.employee_id as assigned_employee_id, u2.employee_id as creator_employee_id,
@@ -2157,6 +2202,7 @@ def list_deals(current_user: dict = Depends(get_current_user)):
             "handles": o["handles"],
             "print_color": o["print_color"],
             "bag_type": o["bag_type"],
+            "print_side": o["print_side"],
             "unit_price": 0.0 if is_fac_mgr else (float(o["unit_price"]) if o["unit_price"] else 0.0),
             "advance_received": 0.0 if is_fac_mgr else (float(o["advance_received"]) if o["advance_received"] else 0.0),
             "balance_amount": 0.0 if is_fac_mgr else (float(o["balance_amount"]) if o["balance_amount"] else 0.0),
@@ -2241,14 +2287,14 @@ def create_deal(req: DealCreate, current_user: dict = Depends(get_current_user))
 
                     cur.execute(
                         """
-                        INSERT INTO orders (customer_id, order_number, total_amount, status, product_type, size, color, gsm, quantity, unit_price, advance_received, balance_amount, expected_delivery_date, created_by, modified_by, source, priority, followup_date, handles, print_color, bag_type)
-                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s) RETURNING id
+                        INSERT INTO orders (customer_id, order_number, total_amount, status, product_type, size, color, gsm, quantity, unit_price, advance_received, balance_amount, expected_delivery_date, created_by, modified_by, source, priority, followup_date, handles, print_color, bag_type, print_side)
+                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s) RETURNING id
                         """,
                         (
                             cust_id,
                             order_number,
                             total_val,
-                            "New|Pending Approval",
+                            "New|Approved",
                             req.product_type or "Standard Box",
                             req.size or "10x10x10",
                             req.color or "Brown",
@@ -2265,13 +2311,41 @@ def create_deal(req: DealCreate, current_user: dict = Depends(get_current_user))
                             req.followup_date,
                             req.handles,
                             req.print_color,
-                            req.bag_type
+                            req.bag_type,
+                            req.print_side
                         )
                     )
                     order_id = cur.fetchone()[0]
 
                     # Deduct stock and lock inventory
                     deduct_and_lock_inventory(cur, order_id, cust_id, req.product_type or "Standard Box", req.quantity or 0)
+
+                    # Insert production record since it is auto-approved/verified!
+                    cur.execute(
+                        """
+                        INSERT INTO production (order_id, status, expected_completion_date, created_by, modified_by)
+                        VALUES (%s, 'PENDING', %s, %s, %s)
+                        """,
+                        (order_id, expected_deliv, uid, uid)
+                    )
+
+                    # Auto-create invoice so newly created deal is immediately visible in Accounts section
+                    inv_number = f"INV-{get_now_ist().strftime('%Y%m%d')}-{order_id}"
+                    adv = req.advance_received or Decimal("0")
+                    if total_val > 0 and adv >= total_val:
+                        init_pay_status = "PAID"
+                    elif adv > 0:
+                        init_pay_status = "PARTIAL"
+                    else:
+                        init_pay_status = "PENDING"
+
+                    cur.execute(
+                        """
+                        INSERT INTO invoices (order_id, invoice_number, subtotal, gst, transport_charge, stereo_charge, total_amount, payment_status)
+                        VALUES (%s, %s, %s, 0, 0, 0, %s, %s)
+                        """,
+                        (order_id, inv_number, total_val, total_val, init_pay_status)
+                    )
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to create deal atomically: {str(e)}")
 
@@ -2349,7 +2423,7 @@ def update_deal(id: int, req: DealUpdate, stage: Optional[str] = None, status: O
             product_type = %s, size = %s, color = %s, gsm = %s, quantity = %s, unit_price = %s,
             advance_received = %s, balance_amount = %s, expected_delivery_date = %s,
             source = %s, priority = %s, followup_date = %s,
-            handles = %s, print_color = %s, bag_type = %s,
+            handles = %s, print_color = %s, bag_type = %s, print_side = %s,
             modified_by = %s, modified_at = CURRENT_TIMESTAMP
         WHERE id = %s
         """,
@@ -2372,6 +2446,7 @@ def update_deal(id: int, req: DealUpdate, stage: Optional[str] = None, status: O
             req.handles if req.handles is not None else order["handles"],
             req.print_color if req.print_color is not None else order["print_color"],
             req.bag_type if req.bag_type is not None else order["bag_type"],
+            req.print_side if req.print_side is not None else order["print_side"],
             uid,
             id
         )
@@ -2503,6 +2578,7 @@ def update_deal_inventory_status(id: int, status: str = Query(...), current_user
 
 @app.get("/inventory")
 def get_inventory(current_user: dict = Depends(get_current_user)):
+    db_execute("UPDATE inventory SET current_stock = 0 WHERE current_stock < 0")
     items = db_query(
         """
         SELECT i.id, i.category, i.current_stock, i.minimum_stock,
@@ -2516,18 +2592,18 @@ def get_inventory(current_user: dict = Depends(get_current_user)):
     )
     formatted = []
     for item in items:
-
+        stock_val = max(0.0, float(item["current_stock"]))
         status = "In Stock"
-        if item["current_stock"] <= 0:
+        if stock_val <= 0:
             status = "Out of Stock"
-        elif item["current_stock"] <= item["minimum_stock"]:
+        elif stock_val <= item["minimum_stock"]:
             status = "Low Stock"
 
         formatted.append({
             "id": item["id"],
             "name": item["item_name"] or "Unknown Item",
             "sku": f"SKU-{item['id']:03d}",
-            "stock": float(item["current_stock"]),
+            "stock": stock_val,
             "minimum_stock": float(item["minimum_stock"]),
             "price": "₹10",
             "status": status,
@@ -2872,18 +2948,48 @@ def update_production_status(id: int, req: ProductionUpdate, current_user: dict 
 
 @app.get("/invoices")
 def list_invoices(current_user: dict = Depends(get_current_user)):
+    # Auto-generate missing invoices for any orders created without an invoice record
+    unregistered_orders = db_query("""
+        SELECT o.id, o.order_number, o.total_amount, o.advance_received
+        FROM orders o
+        LEFT JOIN invoices i ON o.id = i.order_id
+        WHERE i.id IS NULL
+    """)
+    for ord_item in unregistered_orders:
+        inv_num = f"INV-{get_now_ist().strftime('%Y%m%d')}-{ord_item['id']}"
+        total_amt = ord_item["total_amount"] or Decimal("0")
+        adv = ord_item["advance_received"] or Decimal("0")
+        if total_amt > 0 and adv >= total_amt:
+            p_status = "PAID"
+        elif adv > 0:
+            p_status = "PARTIAL"
+        else:
+            p_status = "PENDING"
+        try:
+            db_execute("""
+                INSERT INTO invoices (order_id, invoice_number, subtotal, gst, transport_charge, stereo_charge, total_amount, payment_status)
+                VALUES (%s, %s, %s, 0, 0, 0, %s, %s)
+            """, (ord_item["id"], inv_num, total_amt, total_amt, p_status))
+        except Exception as e:
+            print(f"Error auto-generating invoice for order {ord_item['id']}: {e}")
+
     invs = db_query(
         """
-        SELECT i.*, o.order_number, c.company_name
+        SELECT i.*, o.order_number, c.company_name, o.created_by as order_created_by, o.lead_id as order_lead_id, l.assigned_sales_id as lead_assigned_sales_id,
+               o.advance_received, o.balance_amount
         FROM invoices i
         JOIN orders o ON i.order_id = o.id
         JOIN customers c ON o.customer_id = c.id
+        LEFT JOIN leads l ON o.lead_id = l.id
         ORDER BY i.generated_at DESC
         """
     )
 
     formatted = []
     for iv in invs:
+        tot = float(iv["total_amount"])
+        adv = float(iv["advance_received"]) if iv.get("advance_received") is not None else 0.0
+        bal = float(iv["balance_amount"]) if iv.get("balance_amount") is not None else max(0.0, tot - adv)
         formatted.append({
             "id": iv["id"],
             "order_id": iv["order_id"],
@@ -2894,9 +3000,13 @@ def list_invoices(current_user: dict = Depends(get_current_user)):
             "gst": float(iv["gst"]),
             "transport_charge": float(iv["transport_charge"]),
             "stereo_charge": float(iv["stereo_charge"]),
-            "total_amount": float(iv["total_amount"]),
+            "total_amount": tot,
+            "advance_received": adv,
+            "balance_amount": bal,
             "payment_status": iv["payment_status"],
-            "generated_at": iv["generated_at"].isoformat() if iv["generated_at"] else None
+            "generated_at": iv["generated_at"].isoformat() if iv["generated_at"] else None,
+            "order_created_by": iv["order_created_by"],
+            "lead_assigned_sales_id": iv["lead_assigned_sales_id"]
         })
     return {"status": "success", "invoices": formatted}
 
@@ -2917,15 +3027,49 @@ def create_invoice(req: InvoiceCreate, current_user: dict = Depends(RoleChecker(
     return {"status": "success", "message": "Invoice generated successfully"}
 
 @app.put("/invoice/{id}/payment")
-def update_invoice_payment_status(id: int, req: InvoicePaymentUpdate, current_user: dict = Depends(RoleChecker(["admin", "accountant", "accounts"]))):
+def update_invoice_payment_status(id: int, req: InvoicePaymentUpdate, current_user: dict = Depends(get_current_user)):
+    uid = current_user["id"]
+    role = current_user["role"].lower()
+    
     inv = db_query("SELECT * FROM invoices WHERE id = %s", (id,), fetch_one=True)
     if not inv:
         raise HTTPException(status_code=404, detail="Invoice not found")
 
-    db_execute("UPDATE invoices SET payment_status = %s WHERE id = %s", (req.payment_status, id))
+    if role == "sales":
+        order = db_query("SELECT created_by, lead_id FROM orders WHERE id = %s", (inv["order_id"],), fetch_one=True)
+        if not order:
+            raise HTTPException(status_code=404, detail="Order not found")
+        is_owner = (order["created_by"] == uid)
+        if not is_owner and order["lead_id"]:
+            lead = db_query("SELECT assigned_sales_id, created_by FROM leads WHERE id = %s", (order["lead_id"],), fetch_one=True)
+            if lead and (lead["assigned_sales_id"] == uid or lead["created_by"] == uid):
+                is_owner = True
+        if not is_owner:
+            raise HTTPException(status_code=403, detail="Access denied: You do not own this order's invoice")
+    elif role not in ["admin", "hr", "sales manager", "accountant", "accounts"]:
+        raise HTTPException(status_code=403, detail="Access denied: Unauthorized role")
 
-    if req.payment_status == "PAID":
+    tot_amt = Decimal(str(inv["total_amount"]))
+    new_status = req.payment_status
 
+    if req.amount_received is not None:
+        amt_rec = Decimal(str(req.amount_received))
+        bal_amt = max(Decimal("0"), tot_amt - amt_rec)
+        db_execute("UPDATE orders SET advance_received = %s, balance_amount = %s WHERE id = %s", (amt_rec, bal_amt, inv["order_id"]))
+        if not new_status:
+            if amt_rec >= tot_amt:
+                new_status = "PAID"
+            elif amt_rec > Decimal("0"):
+                new_status = "PARTIAL"
+            else:
+                new_status = "PENDING"
+
+    if not new_status:
+        new_status = inv["payment_status"]
+
+    db_execute("UPDATE invoices SET payment_status = %s WHERE id = %s", (new_status, id))
+
+    if new_status == "PAID":
         db_status = "Closed Won|PAYMENT_RECEIVED"
         db_execute("UPDATE orders SET status = %s WHERE id = %s", (db_status, inv["order_id"]))
 

@@ -2,6 +2,7 @@ import os
 from datetime import datetime, timedelta
 import bcrypt
 import jwt
+from typing import Optional
 from fastapi import Depends, HTTPException, status
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from Database import db_query
@@ -11,6 +12,27 @@ ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 60 * 24
 
 security = HTTPBearer()
+security_optional = HTTPBearer(auto_error=False)
+
+def get_optional_current_user(credentials: Optional[HTTPAuthorizationCredentials] = Depends(security_optional)):
+    if not credentials:
+        return None
+    token = credentials.credentials
+    try:
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        user_id = payload.get("sub")
+        if user_id is None:
+            return None
+    except jwt.PyJWTError:
+        return None
+
+    return db_query("""
+        SELECT u.*, r.role_name as role 
+        FROM users u 
+        LEFT JOIN roles r ON u.role_id = r.id 
+        WHERE u.id = %s
+    """, (int(user_id),), fetch_one=True)
+
 
 def hash_password(password: str) -> str:
     """Hash a password using bcrypt."""
